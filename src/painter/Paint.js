@@ -257,7 +257,7 @@ const Painting = ({ cssContainerRef, orbitControlsRef }) => {
     <>
       <group
         scale={1.0}
-        rotation={[0, -90*Math.PI/180, 0]}
+        rotation={[0, -95*Math.PI/180, 7*Math.PI/180]}
       >
         {getModel(model, handleScreenAnchor, cssScreen)}
       </group>
