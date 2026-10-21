@@ -82,7 +82,7 @@ const _worldOffset = new THREE.Vector3();
 
 // Owns the second (CSS3D) renderer that sits alongside the WebGL <Canvas>
 // and projects an <iframe> of the 2D site (hosted separately, in the
-// im_map repo) onto the "Screen" mesh's world transform every frame, using
+// kernel_bsod repo) onto the "Screen" mesh's world transform every frame, using
 // the same camera as the WebGL scene.
 export class CSS3DScreenController {
   constructor({ src, pixelWidth = 1280, pixelHeight = 900 }) {
@@ -101,7 +101,7 @@ export class CSS3DScreenController {
 
     const iframe = document.createElement("iframe");
     iframe.src = src;
-    iframe.title = "im_map";
+    iframe.title = "kernel_bsod";
     iframe.style.width = `${pixelWidth}px`;
     iframe.style.height = `${pixelHeight}px`;
     iframe.style.border = "0";
@@ -112,6 +112,15 @@ export class CSS3DScreenController {
 
     this.object = new CSS3DObject(iframe);
     this.scene.add(this.object);
+  }
+
+  // Clicking inside a cross-origin iframe never dispatches events to the
+  // parent document (that's distinct from mouseenter/leave, which the outer
+  // document still fires), so there's no click event to listen for here.
+  // Instead, Paint.js polls this every frame: clicking the iframe gives it
+  // DOM focus, and clicking anything else blurs it back automatically.
+  isClicked() {
+    return document.activeElement === this.iframe;
   }
 
   mount(container) {
