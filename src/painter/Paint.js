@@ -20,6 +20,17 @@ extend({ MiniKuwaharaPass, TensorPass, KuwaharaPass, FinalPass });
 // part of this app — this is the only thing that connects the two.
 const DESKTOP_URL = "https://sophtsang.github.io/kernel_bsod";
 
+// All the zoom numbers below (base zoom, click-focus zoom, OrbitControls'
+// min/max zoom, the Kuwahara auto-disable threshold) were tuned by eye at
+// this window size — everything scales off it so the framing holds up on a
+// narrower screen (phone) instead of coming in way too zoomed-in. Tweak this
+// if the initial framing feels off on your own dev window.
+const ZOOM_REFERENCE_DIMENSION = 795;
+const BASE_ZOOM = 300;
+const BASE_MIN_ZOOM = 200;
+const BASE_MAX_ZOOM = 1500;
+const BASE_KUWAHARA_ZOOM_THRESHOLD = 700;
+
 // Reused across frames (avoids allocating in the render loop) for the
 // hover-focus camera snap below.
 const _anchorPos = new THREE.Vector3();
@@ -32,6 +43,7 @@ const _targetPos = new THREE.Vector3();
 const _targetQuat = new THREE.Quaternion();
 const _currentForward = new THREE.Vector3();
 const _currentUp = new THREE.Vector3();
+const _anchorScale = new THREE.Vector3();
 // throwaway Object3D used only to borrow Object3D.lookAt's matrix math
 // (which respects a custom `up`) to derive _targetQuat
 const _dummy = new THREE.Object3D();
@@ -62,7 +74,12 @@ const Painting = ({ cssContainerRef, orbitControlsRef }) => {
     quaternion: new THREE.Quaternion(),
     zoom: 1,
   });
+  const hasSetInitialZoomRef = useRef(false);
   const { size } = useThree();
+  // Ratio of this window's narrower dimension to the reference size the
+  // zoom constants were tuned at — multiply any of those constants by this
+  // to get a value that holds the same apparent framing on this device.
+  const zoomScale = Math.min(size.width, size.height) / ZOOM_REFERENCE_DIMENSION;
 
   const { miniKuwaharaPass, tensorPass, finalPass, radius, model } = useControls({
     passes: folder({
@@ -95,11 +112,12 @@ const Painting = ({ cssContainerRef, orbitControlsRef }) => {
     }),
   });
 
-  const { clickFocus, focusDistance, focusZoom, focusLerpSpeed } = useControls({
+  const { clickFocus, focusDistance, focusZoom, focusFitMargin, focusLerpSpeed } = useControls({
     focus: folder({
       clickFocus: { value: true, label: "focus on click" },
       focusDistance: { value: 2, min: 0.1, max: 10, step: 0.1 },
       focusZoom: { value: 1200, min: 500, max: 1350, step: 10 },
+      focusFitMargin: { value: 0.92, min: 0.5, max: 1, step: 0.01 },
       focusLerpSpeed: { value: 1, min: 1, max: 3, step: 0.5 },
     }),
   });
@@ -146,6 +164,32 @@ const Painting = ({ cssContainerRef, orbitControlsRef }) => {
   useFrame((state, delta) => {
     const { gl, scene, camera } = state;
 
+    // Give the camera a scaled starting zoom once, so it doesn't open way
+    // too zoomed-in on a narrow (phone) screen. Only once, guarded by the
+    // ref — this shouldn't keep fighting a user's own scroll-zoom on later
+    // resizes (e.g. rotating the phone) after they've already interacted.
+    // Done here rather than an effect: Painting/OrbitControls/OrthographicCamera
+    // are siblings, so an effect here could run before OrbitControls' ref is
+    // attached or before OrthographicCamera's makeDefault swap lands on
+    // useThree().camera — useFrame only starts ticking once the whole tree
+    // (including those sibling effects) has committed, so camera/controls
+    // are already the real, final objects by the time this runs.
+    if (!hasSetInitialZoomRef.current) {
+      camera.zoom = BASE_ZOOM * zoomScale;
+      camera.updateProjectionMatrix();
+      hasSetInitialZoomRef.current = true;
+    }
+
+    // OrbitControls' min/max zoom are hard clamps — these have to scale too,
+    // or e.g. a phone's scaled-down initial zoom could sit below a fixed
+    // minZoom and get clamped right back up to the desktop value. Cheap and
+    // idempotent, so just keep it in sync every frame rather than add an
+    // effect + dependency array for it.
+    if (orbitControlsRef.current) {
+      orbitControlsRef.current.minZoom = BASE_MIN_ZOOM * zoomScale;
+      orbitControlsRef.current.maxZoom = BASE_MAX_ZOOM * zoomScale;
+    }
+
     if (materialRef.current) {
       materialRef.current.uniforms.uPaintNormalMap.value = paintNormalTexture;
     }
@@ -164,7 +208,7 @@ const Painting = ({ cssContainerRef, orbitControlsRef }) => {
     tensorPassRef.current.enabled = tensorPass;
     // this shader is actually terrible for performance, so when interacting with 2d screen
     // disable it
-    kuwaharaPassRef.current.enabled = camera.zoom < 700;
+    kuwaharaPassRef.current.enabled = camera.zoom < BASE_KUWAHARA_ZOOM_THRESHOLD * zoomScale;
     finalPassRef.current.enabled = finalPass;
     gl.setRenderTarget(null);
     // gl.render(scene, camera);
@@ -204,8 +248,8 @@ const Painting = ({ cssContainerRef, orbitControlsRef }) => {
     if (focused) {
       focusProgressRef.current = THREE.MathUtils.damp(focusProgressRef.current, 1, focusLerpSpeed, delta);
 
-      screenAnchor.getWorldPosition(_anchorPos);
-      screenAnchor.getWorldQuaternion(_anchorQuat);
+      screenAnchor.updateWorldMatrix(true, false);
+      screenAnchor.matrixWorld.decompose(_anchorPos, _anchorQuat, _anchorScale);
       // Anchor-local +Z is the glass's normal axis, +Y its "up" (see the
       // axis comment in CSS3DScreen.js's computeScreenAnchor).
       _normalWorld.set(0, 0, 1).applyQuaternion(_anchorQuat).normalize();
@@ -229,7 +273,18 @@ const Painting = ({ cssContainerRef, orbitControlsRef }) => {
 
       camera.position.lerpVectors(savedPoseRef.current.position, _targetPos, focusProgressRef.current);
       camera.quaternion.copy(savedPoseRef.current.quaternion).slerp(_targetQuat, focusProgressRef.current);
-      camera.zoom = THREE.MathUtils.lerp(savedPoseRef.current.zoom, focusZoom, focusProgressRef.current);
+
+      // Cap the zoom so the screen's own rectangle (in world units, from
+      // the anchor's world scale — same math CSS3DScreenController.syncToAnchor
+      // uses to size the iframe) can never grow past the viewport on either
+      // axis: the zoom that exactly fits each axis is size/worldExtent for
+      // that axis, and the smaller of the two is whichever axis is tightest.
+      const screenWorldWidth = screenAnchor.userData.width * _anchorScale.x;
+      const screenWorldHeight = screenAnchor.userData.height * _anchorScale.y;
+      const fitZoom = Math.min(size.width / screenWorldWidth, size.height / screenWorldHeight) * focusFitMargin;
+
+      const targetZoom = Math.min(focusZoom * zoomScale, fitZoom);
+      camera.zoom = THREE.MathUtils.lerp(savedPoseRef.current.zoom, targetZoom, focusProgressRef.current);
       camera.updateProjectionMatrix();
     }
 
